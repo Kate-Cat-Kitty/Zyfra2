@@ -1,6 +1,9 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-using System.Text;
+
+using Microsoft.EntityFrameworkCore;
 using System.Security.Cryptography;
+using System.Text;
+using System;
 
 namespace lab2.Controllers
 {
@@ -8,205 +11,101 @@ namespace lab2.Controllers
     [ApiController]
     public class PeoplesController : ControllerBase
     {
-        private static Dictionary<string, (string PasswordHash, int Status)> validUsers = new Dictionary<string, (string, int)>();
-        private static Dictionary<string, string> sessions = new Dictionary<string, string>(); // sessionId -> username
+        private readonly ApplicationDbContext _context;
 
-        public PeoplesController()
+        public PeoplesController(ApplicationDbContext context)
         {
-            LoadUsers();
-            LoadSessions();
-            EnsurePasswordsAreHashed(); // Убедимся, что все пароли в файле захэшированы
+            _context = context;
         }
 
-        // Загрузка пользователей из файла
-        private void LoadUsers()
-        {
-            if (System.IO.File.Exists("users.txt"))
-            {
-                var lines = System.IO.File.ReadAllLines("users.txt");
-                validUsers.Clear();
-                foreach (var line in lines)
-                {
-                    var parts = line.Split(',');
-                    if (parts.Length == 3)
-                    {
-                        validUsers[parts[0]] = (parts[1], int.Parse(parts[2]));
-                    }
-                }
-            }
-        }
-
-        // Сохранение пользователей в файл
-        private void SaveUsers()
-        {
-            var lines = validUsers.Select(user => $"{user.Key},{user.Value.PasswordHash},{user.Value.Status}");
-            System.IO.File.WriteAllLines("users.txt", lines);
-        }
-
-        // Загрузка сессий из файла
-        private void LoadSessions()
-        {
-            if (System.IO.File.Exists("sessions.txt"))
-            {
-                var lines = System.IO.File.ReadAllLines("sessions.txt");
-                sessions.Clear();
-                foreach (var line in lines)
-                {
-                    var parts = line.Split(',');
-                    if (parts.Length == 2)
-                    {
-                        sessions[parts[0]] = parts[1]; // sessionId -> username
-                    }
-                }
-            }
-        }
-
-        // Сохранение сессий в файл
-        private void SaveSessions()
-        {
-            var lines = sessions.Select(session => $"{session.Key},{session.Value}");
-            System.IO.File.WriteAllLines("sessions.txt", lines);
-        }
-
-        // Убедимся, что все пароли захэшированы
-        private void EnsurePasswordsAreHashed()
-        {
-            bool updated = false;
-
-            foreach (var user in validUsers.ToList())
-            {
-                if (!IsHashed(user.Value.PasswordHash))
-                {
-                    validUsers[user.Key] = (PasswordHasher.HashPassword(user.Value.PasswordHash), user.Value.Status);
-                    updated = true;
-                }
-            }
-
-            if (updated)
-            {
-                SaveUsers(); // Сохраняем изменения
-            }
-        }
-
-        // Проверка, является ли строка хэшем (условная проверка на длину Base64)
-        private bool IsHashed(string password)
-        {
-            return password.Length == 44; // Длина Base64 строки для SHA256
-        }
-
-        // GET /api/peoples - Получить список всех пользователей
+        // GET /api/peoples
         [HttpGet]
-        public IActionResult GetAllUsers()
+        public async Task<IActionResult> GetAllUsers()
         {
-            return Ok(validUsers.Keys);
+            var users = await _context.Users.Select(u => u.Username).ToListAsync();
+            return Ok(users);
         }
 
-        // POST /api/peoples/register - Регистрация нового пользователя
+        // POST /api/peoples/register
         [HttpPost("register")]
-        public IActionResult Register([FromBody] LoginRequest request)
+        public async Task<IActionResult> Register([FromBody] LoginRequest request)
         {
-            if (validUsers.ContainsKey(request.Username))
-            {
+            if (await _context.Users.AnyAsync(u => u.Username == request.Username))
                 return BadRequest("Пользователь уже существует.");
-            }
 
-            // Хэшируем пароль и добавляем нового пользователя
-            validUsers[request.Username] = (PasswordHasher.HashPassword(request.PasswordHash), 0);
-            SaveUsers();
+            var user = new User
+            {
+                Username = request.Username,
+                PasswordHash = PasswordHasher.HashPassword(request.PasswordHash),
+                Status = 0
+            };
+
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
+
             return Ok("Пользователь зарегистрирован.");
         }
 
-        // POST /api/peoples/login - Вход пользователя
+        // POST /api/peoples/login
         [HttpPost("login")]
-        public IActionResult Login([FromBody] LoginRequest request)
+        public async Task<IActionResult> Login([FromBody] LoginRequest request)
         {
-            if (!validUsers.ContainsKey(request.Username))
-            {
-                return Unauthorized();
-            }
+            var user = await _context.Users.FirstOrDefaultAsync(u => u.Username == request.Username);
 
-            var user = validUsers[request.Username];
-            var hashedPassword = PasswordHasher.HashPassword(request.PasswordHash);
+            if (user == null || user.PasswordHash != PasswordHasher.HashPassword(request.PasswordHash))
+                return Unauthorized("Неверный логин или пароль.");
 
-            // Сравнение пароля
-            if (user.PasswordHash != hashedPassword)
-            {
-                return Unauthorized("Неверный пароль.");
-            }
-
-            // Проверка на активную сессию
             if (user.Status == 1)
+                return Conflict("Пользователь уже вошел в систему.");
+
+            var session = new Session
             {
-                return Conflict();
-            }
+                SessionId = Guid.NewGuid().ToString(),
+                UserId = user.Id
+            };
 
-            // Создание сессии
-            string sessionId = Guid.NewGuid().ToString();
-            sessions[sessionId] = request.Username;
+            user.Status = 1;
 
-            // Обновление статуса пользователя на 1 (активен)
-            validUsers[request.Username] = (user.PasswordHash, 1);
+            _context.Sessions.Add(session);
+            await _context.SaveChangesAsync();
 
-            SaveSessions();
-            SaveUsers();
-
-            return Ok(new { SessionId = sessionId, request.Username });
+            return Ok(new { SessionId = session.SessionId, user.Username });
         }
 
-        // POST /api/peoples/logout - Выход пользователя по адресу сессии
+        // POST /api/peoples/logout
         [HttpPost("logout")]
-        public IActionResult Logout([FromBody] LogoutRequest request)
+        public async Task<IActionResult> Logout([FromBody] LogoutRequest request)
         {
-            // Ищем сессию по SessionId
-            if (!sessions.ContainsKey(request.SessionId))
-            {
+            var session = await _context.Sessions
+                .Include(s => s.User)
+                .FirstOrDefaultAsync(s => s.SessionId == request.SessionId);
+
+            if (session == null)
                 return NotFound("Сессия не найдена.");
-            }
 
-            var username = sessions[request.SessionId];
+            session.User.Status = 0;
 
-            // Удаляем сессию
-            sessions.Remove(request.SessionId);
+            _context.Sessions.Remove(session);
+            await _context.SaveChangesAsync();
 
-            // Меняем статус пользователя на 0 (неактивен)
-            validUsers[username] = (validUsers[username].PasswordHash, 0);
-
-            SaveSessions();
-            SaveUsers();
-
-            return Ok($"Пользователь {username} вышел из системы.");
+            return Ok($"Пользователь {session.User.Username} вышел из системы.");
         }
 
-        // Получение сессии пользователя по логину и паролю
+        // GET /api/peoples/session
         [HttpGet("session")]
-        public IActionResult GetUserSession([FromQuery] string username, [FromQuery] string password)
+        public async Task<IActionResult> GetUserSession([FromQuery] string username, [FromQuery] string password)
         {
-            // Проверка на наличие пользователя
-            if (!validUsers.ContainsKey(username))
-            {
-                return NotFound("Пользователь не найден.");
-            }
+            var user = await _context.Users.FirstOrDefaultAsync(u => u.Username == username);
 
-            var user = validUsers[username];
-            var hashedPassword = PasswordHasher.HashPassword(password);
+            if (user == null || user.PasswordHash != PasswordHasher.HashPassword(password))
+                return Unauthorized("Неверный логин или пароль.");
 
-            // Проверка пароля
-            if (user.PasswordHash != hashedPassword)
-            {
-                return Unauthorized("Неверный пароль.");
-            }
+            var session = await _context.Sessions.FirstOrDefaultAsync(s => s.UserId == user.Id);
 
-            // Поиск сессии для пользователя
-            var session = sessions.FirstOrDefault(s => s.Value == username);
-
-            if (session.Equals(default(KeyValuePair<string, string>)))
-            {
+            if (session == null)
                 return NotFound("Активной сессии нет.");
-            }
 
-            return Ok(new { SessionId = session.Key });
+            return Ok(new { SessionId = session.SessionId });
         }
     }
-
-   
 }
